@@ -22,7 +22,7 @@ API_ID = int(environ.get("API_ID", "22244082"))
 API_HASH = environ.get("API_HASH", "fc90b0390b0130286c2676a19ed9c4da")
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
 
-PICS = (environ.get('PICS', 'https://graph.org/file/ce1723991756e48c35aa1.jpg')).split() # Bot Start Picture
+PICS = (environ.get('PICS', 'https://graph.org/file/46e215b0486fe8fc87a21-428e1aa05fedc39b7a.jpg')).split() # Bot Start Picture
 ADMINS = [int(admin) if id_pattern.search(admin) else admin for admin in environ.get('ADMINS', '5055129943').split()]
 BOT_USERNAME = environ.get("BOT_USERNAME", "CreazyFilestore_bot") # without @
 PORT = environ.get("PORT", "8080")
