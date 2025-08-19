@@ -31,7 +31,7 @@ PORT = environ.get("PORT", "8080")
 CLONE_MODE = bool(environ.get('CLONE_MODE', True)) # Set True or False
 
 # If Clone Mode Is True Then Fill All Required Variable, If False Then Don't Fill.
-CLONE_DB_URI = environ.get("CLONE_DB_URI", "mongodb+srv://revayi9926:Akash2001@cluster0.fwjvq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+CLONE_DB_URI = environ.get("CLONE_DB_URI", "mongodb+srv://creazystore60:sampa9735@cluster0.4xslp.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 CDB_NAME = environ.get("CDB_NAME", "clonetechvj")
 
 # Database Information
