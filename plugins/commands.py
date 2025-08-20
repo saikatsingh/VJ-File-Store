@@ -11,7 +11,7 @@ from Script import script
 from plugins.dbusers import db
 from pyrogram import Client, filters, enums
 from plugins.users_api import get_user, update_user_info
-from pyrogram.errors import ChatAdminRequired, FloodWait
+from pyrogram.errors import ChatAdminRequired, FloodWait, UserNotParticipant
 from pyrogram.types import *
 from utils import verify_user, check_token, check_verification, get_token
 from config import *
@@ -20,13 +20,89 @@ import json
 import base64
 from urllib.parse import quote_plus
 from TechVJ.utils.file_properties import get_name, get_hash, get_media_file_size
+
 logger = logging.getLogger(__name__)
 
 BATCH_FILES = {}
 
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
+# ------------- Multi Force-Subscribe Helper -------------
+# REQUIRED in config.py:
+# FORCE_SUB_CHANNELS = [int(x) for x in environ.get("FORCE_SUB_CHANNELS", "").split()]
+# OPTIONAL in config.py:
+# FSUB_TEXT = environ.get("FSUB_TEXT", "⚠️ Pehle niche wale channels join karo, phir 'Refresh' dabao.")
+FSUB_TEXT = globals().get("FSUB_TEXT", "⚠️ Please join all required channels first and then press Refresh.")
+
+async def _safe_invite_link(client: Client, channel_id: int):
+    """
+    Try to get an invite link. If export fails (bot not admin) but channel is public,
+    fallback to https://t.me/username. If nothing works, returns None.
+    """
+    try:
+        chat = await client.get_chat(channel_id)
+        # if invite_link already exists
+        if chat.invite_link:
+            return chat.title, chat.invite_link
+        # try exporting (requires admin)
+        try:
+            link = await client.export_chat_invite_link(channel_id)
+            return chat.title, link
+        except Exception:
+            # fallback to public @username link
+            if chat.username:
+                return chat.title, f"https://t.me/{chat.username}"
+            return chat.title, None
+    except Exception:
+        return "Channel", None
+
+async def check_force_subscribe(client: Client, user_id: int):
+    """
+    Checks if user joined ALL FORCE_SUB_CHANNELS.
+    Returns (True, None) if all joined.
+    Else returns (False, InlineKeyboardMarkup) with join buttons + refresh.
+    """
+    channels = []
+    need_join = []
+
+    # If no channels configured, allow.
+    fsubs = globals().get("FORCE_SUB_CHANNELS", [])
+    if not fsubs:
+        return True, None
+
+    # collect channel info and membership
+    for ch_id in fsubs:
+        title, link = await _safe_invite_link(client, ch_id)
+        channels.append((ch_id, title, link))
+        try:
+            member = await client.get_chat_member(ch_id, user_id)
+            if getattr(member, "status", "") in ["kicked"]:
+                # kicked users are considered not allowed
+                need_join.append((ch_id, title, link))
+            # left users raise UserNotParticipant usually,
+            # but handle explicitly if API returns "left"
+            if getattr(member, "status", "") in ["left"]:
+                need_join.append((ch_id, title, link))
+        except UserNotParticipant:
+            need_join.append((ch_id, title, link))
+        except Exception:
+            # if we can't verify, be safe and ask to join
+            need_join.append((ch_id, title, link))
+
+    if not need_join:
+        return True, None
+
+    # build buttons: one row per channel
+    rows = []
+    for _, title, link in need_join:
+        if link:
+            rows.append([InlineKeyboardButton(f"Join {title}", url=link)])
+        else:
+            # if link is None, show disabled text button + ask admin to add bot as admin to export link
+            rows.append([InlineKeyboardButton(f"Join {title} (link unavailable)", url="https://t.me/")])
+
+    # refresh row
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_fsub")])
+    return False, InlineKeyboardMarkup(rows)
+# ------------- /Multi Force-Subscribe Helper -------------
 
 
 def get_size(size):
@@ -47,17 +123,25 @@ def formate_file_name(file_name):
     file_name = '@VJ_Botz ' + ' '.join(filter(lambda x: not x.startswith('http') and not x.startswith('@') and not x.startswith('www.'), file_name.split()))
     return file_name
 
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ0
-
 
 @Client.on_message(filters.command("start") & filters.incoming)
 async def start(client, message):
     username = client.me.username
+
+    # ---- Force-Subscribe check (start pe mandatory) ----
+    ok, kb = await check_force_subscribe(client, message.from_user.id)
+    if not ok:
+        return await message.reply_text(
+            FSUB_TEXT,
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+    # -----------------------------------------------------
+
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
         await client.send_message(LOG_CHANNEL, script.LOG_TEXT.format(message.from_user.id, message.from_user.mention))
+
     if len(message.command) != 2:
         buttons = [[
             InlineKeyboardButton('💝 sᴜʙsᴄʀɪʙᴇ ᴍʏ ʏᴏᴜᴛᴜʙᴇ ᴄʜᴀɴɴᴇʟ', url='https://youtube.com/@Tech_VJ')
@@ -78,17 +162,15 @@ async def start(client, message):
             reply_markup=reply_markup
         )
         return
-
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
     
+    # deep-link or file token path
     data = message.command[1]
     try:
         pre, file_id = data.split('_', 1)
     except:
         file_id = data
         pre = ""
+
     if data.split("-", 1)[0] == "verify":
         userid = data.split("-", 2)[1]
         token = data.split("-", 3)[2]
@@ -109,7 +191,18 @@ async def start(client, message):
                 text="<b>Invalid link or Expired link !</b>",
                 protect_content=True
             )
+
     elif data.split("-", 1)[0] == "BATCH":
+        # ---- Force-Subscribe check for batch files ----
+        ok, kb = await check_force_subscribe(client, message.from_user.id)
+        if not ok:
+            return await message.reply_text(
+                FSUB_TEXT,
+                reply_markup=kb,
+                disable_web_page_preview=True
+            )
+        # ------------------------------------------------
+
         try:
             if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
                 btn = [[
@@ -125,6 +218,7 @@ async def start(client, message):
                 return
         except Exception as e:
             return await message.reply_text(f"**Error - {e}**")
+
         sts = await message.reply("**🔺 ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ**")
         file_id = data.split("-", 1)[1]
         msgs = BATCH_FILES.get(file_id)
@@ -208,11 +302,19 @@ async def start(client, message):
             await k.edit_text("<b>Your All Files/Videos is successfully deleted!!!</b>")
         return
 
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
-
+    # single file deep link
     pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
+
+    # ---- Force-Subscribe check for single file ----
+    ok, kb = await check_force_subscribe(client, message.from_user.id)
+    if not ok:
+        return await message.reply_text(
+            FSUB_TEXT,
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+    # ------------------------------------------------
+
     if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
         btn = [[
             InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
@@ -225,6 +327,7 @@ async def start(client, message):
             reply_markup=InlineKeyboardMarkup(btn)
         )
         return
+
     try:
         msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
         if msg.media:
@@ -266,13 +369,16 @@ async def start(client, message):
         return
     except:
         pass
-        
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
+
 
 @Client.on_message(filters.command('api') & filters.private)
 async def shortener_api_handler(client, m: Message):
+    # ---- Force-Subscribe check ----
+    ok, kb = await check_force_subscribe(client, m.from_user.id)
+    if not ok:
+        return await m.reply_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+    # --------------------------------
+
     user_id = m.from_user.id
     user = await get_user(user_id)
     cmd = m.command
@@ -286,12 +392,15 @@ async def shortener_api_handler(client, m: Message):
         await update_user_info(user_id, {"shortener_api": api})
         await m.reply("<b>Shortener API updated successfully to</b> " + api)
 
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
 
 @Client.on_message(filters.command("base_site") & filters.private)
 async def base_site_handler(client, m: Message):
+    # ---- Force-Subscribe check ----
+    ok, kb = await check_force_subscribe(client, m.from_user.id)
+    if not ok:
+        return await m.reply_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+    # --------------------------------
+
     user_id = m.from_user.id
     user = await get_user(user_id)
     cmd = m.command
@@ -309,14 +418,28 @@ async def base_site_handler(client, m: Message):
         await update_user_info(user_id, {"base_site": base_site})
         await m.reply("<b>Base Site updated successfully</b>")
 
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
 
 @Client.on_callback_query()
 async def cb_handler(client: Client, query: CallbackQuery):
+    # ---- Handle Force-Subscribe refresh ----
+    if query.data == "refresh_fsub":
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if ok:
+            try:
+                await query.message.edit_text("✅ You’re all set! Ab aap bot use kar sakte ho.")
+            except Exception:
+                await query.answer("✅ Joined verified!", show_alert=True)
+        else:
+            try:
+                await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                await query.answer("⚠️ Please join all required channels.", show_alert=True)
+        return
+    # ----------------------------------------
+
     if query.data == "close_data":
         await query.message.delete()
+
     elif query.data == "about":
         buttons = [[
             InlineKeyboardButton('Hᴏᴍᴇ', callback_data='start'),
@@ -334,12 +457,17 @@ async def cb_handler(client: Client, query: CallbackQuery):
             reply_markup=reply_markup,
             parse_mode=enums.ParseMode.HTML
         )
-
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
     
     elif query.data == "start":
+        # ---- Force-Subscribe check on start callback ----
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if not ok:
+            try:
+                return await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                return await query.answer("⚠️ Join required channels first.", show_alert=True)
+        # -------------------------------------------------
+
         buttons = [[
             InlineKeyboardButton('💝 sᴜʙsᴄʀɪʙᴇ ᴍʏ ʏᴏᴜᴛᴜʙᴇ ᴄʜᴀɴɴᴇʟ', url='https://youtube.com/@Tech_VJ')
         ],[
@@ -363,10 +491,6 @@ async def cb_handler(client: Client, query: CallbackQuery):
             reply_markup=reply_markup,
             parse_mode=enums.ParseMode.HTML
         )
-
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
     
     elif query.data == "clone":
         buttons = [[
@@ -384,12 +508,17 @@ async def cb_handler(client: Client, query: CallbackQuery):
             reply_markup=reply_markup,
             parse_mode=enums.ParseMode.HTML
         )          
-
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
     
     elif query.data == "help":
+        # ---- Force-Subscribe check on help callback ----
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if not ok:
+            try:
+                return await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                return await query.answer("⚠️ Join required channels first.", show_alert=True)
+        # -------------------------------------------------
+
         buttons = [[
             InlineKeyboardButton('Hᴏᴍᴇ', callback_data='start'),
             InlineKeyboardButton('🔒 Cʟᴏsᴇ', callback_data='close_data')
@@ -404,8 +533,4 @@ async def cb_handler(client: Client, query: CallbackQuery):
             text=script.HELP_TXT,
             reply_markup=reply_markup,
             parse_mode=enums.ParseMode.HTML
-        )  
-        
-# Don't Remove Credit Tg - @VJ_Botz
-# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
-# Ask Doubt on telegram @KingVJ01
+        )
