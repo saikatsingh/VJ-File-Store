@@ -66,7 +66,7 @@ SHORTLINK_API = environ.get("SHORTLINK_API", "c2ed61ca6c91948204db4a4faad7ec5b78
 VERIFY_TUTORIAL = environ.get("VERIFY_TUTORIAL", "https://t.me/howtoopenxlink") # how to open link 
 
 # Website Info:
-WEBSITE_URL_MODE = bool(environ.get('WEBSITE_URL_MODE', True)) # Set True or False
+WEBSITE_URL_MODE = bool(environ.get('WEBSITE_URL_MODE', False)) # Set True or False
 
 # If Website Url Mode Is True Then Fill All Required Variable, If False Then Don't Fill.
 WEBSITE_URL = environ.get("WEBSITE_URL", "https://creazyxfilestore.blogspot.com/2025/03/creazy-filestore-bot.html") # For More Information Check Video On Yt - @Tech_VJ
