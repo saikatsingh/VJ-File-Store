@@ -49,7 +49,7 @@ LOG_CHANNEL = int(environ.get("LOG_CHANNEL", "-1002603703990"))
 
 # Multi Force Subscribe Channels (NEW)
 # Add multiple channel IDs separated by space
-FORCE_SUB_CHANNELS = [int(ch) for ch in environ.get("FORCE_SUB_CHANNELS", "-1001234567890 -1009876543210").split()]
+FORCE_SUB_CHANNELS = [int(ch) for ch in environ.get("FORCE_SUB_CHANNELS", "-1002918526071").split()]
 
 # File Caption Information
 CUSTOM_FILE_CAPTION = environ.get("CUSTOM_FILE_CAPTION", f"{script.CAPTION}")
