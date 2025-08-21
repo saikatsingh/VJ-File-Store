@@ -1,34 +1,29 @@
+# ---------------------- Imports ----------------------
 import os
-import time
 import asyncio
-import logging
 from datetime import datetime, timedelta
 
 from pyrogram import Client, filters
 from pyrogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 
-from config import (
-    OWNER_ID,
-    UPI_ID,
-    PAYMENT_QR,
-    PAYMENT_INFO,
-    ALLOW_SCREENSHOT_SHARE,
-    PAYMENT_PROOF_USERNAME
+# Database & utils
+from database.ia_filterdb import Media, Media2, Media3, Media4
+from database.users_chats_db import db
+from info import (
+    OWNER_ID, OWNER_USERNAME, BOT_USERNAME,
+    LOG_CHANNEL, UPI_ID, PAYMENT_INFO, PAYMENT_QR,
+    ALLOW_SCREENSHOT_SHARE, PAYMENT_PROOF_USERNAME,
+    PROOF_CHANNEL, FORCE_SUB_CHANNELS, SHORTLINK_API, SHORTLINK_URL,
 )
+from utils import get_shortlink, verify_user_token
 
-from database.users_db import add_user, get_user, get_all_users, update_user
-from database.premium_db import add_premium_user, remove_premium_user, get_premium_user
-
-logger = logging.getLogger(__name__)
 
 # ---------------------- Helper Functions ----------------------
 
 def is_owner(user_id: int) -> bool:
+    """Check if the given user is the bot owner"""
     return user_id == OWNER_ID
 
 
@@ -79,386 +74,303 @@ async def send_premium_plans(client: Client, message: Message):
             caption,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
-# ---------------------- Commands ----------------------
+# ---------------------- Force Subscribe Helper ----------------------
+
+async def check_force_sub(client: Client, user_id: int) -> bool:
+    """
+    Check if user has joined all required channels.
+    Returns True if joined, False if not.
+    """
+    try:
+        if not FORCE_SUB_CHANNELS:
+            return True
+
+        for channel in FORCE_SUB_CHANNELS:
+            try:
+                member = await client.get_chat_member(channel, user_id)
+                if member.status in ["kicked", "banned"]:
+                    return False
+            except Exception:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+async def force_sub_message():
+    """Generate force-subscribe message with join buttons"""
+    buttons = []
+    for channel in FORCE_SUB_CHANNELS:
+        buttons.append([InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel.lstrip('@')}")])
+    buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="check_fsub")])
+
+    return "🚨 **You must join our channels to use this bot!**", InlineKeyboardMarkup(buttons)
+
+
+# ---------------------- /start Command ----------------------
 
 @Client.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
-    user = await get_user(message.from_user.id)
-    if not user:
-        await add_user(message.from_user.id)
+    user = message.from_user
 
+    # Save user in DB
+    await db.add_user(user.id, user.first_name)
+
+    # Force-subscribe check
+    if not await check_force_sub(client, user.id):
+        text, markup = await force_sub_message()
+        return await message.reply_text(text, reply_markup=markup)
+
+    # If user used token link
+    if len(message.command) > 1:
+        token = message.command[1]
+        file_id = await verify_user_token(token, user.id)
+        if file_id:
+            file = await Media.find_one({"file_id": file_id})
+            if not file:
+                file = await Media2.find_one({"file_id": file_id})
+            if not file:
+                file = await Media3.find_one({"file_id": file_id})
+            if not file:
+                file = await Media4.find_one({"file_id": file_id})
+
+            if file:
+                try:
+                    return await message.reply_cached_media(
+                        file.file_id,
+                        caption=file.caption or ""
+                    )
+                except Exception:
+                    return await message.reply_text("⚠️ File not found.")
+        else:
+            return await message.reply_text("❌ Invalid or expired link.")
+
+    # Default start message
     buttons = [
-        [InlineKeyboardButton("💎 Premium Plans", callback_data="show_plans")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")]
+        [InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium")],
+        [InlineKeyboardButton("📢 Updates", url=f"https://t.me/{FORCE_SUB_CHANNELS[0].lstrip('@')}")],
     ]
 
     await message.reply_text(
-        f"👋 Hello {message.from_user.mention}!\n\n"
-        "Welcome to **FileStore Bot** 📂\n\n"
-        "⚡ Store your files & get sharable links\n"
-        "💎 Unlock premium for unlimited access",
+        f"👋 Hello {user.mention},\n\n"
+        "I am your **File Store Bot** 📂.\n\n"
+        "➡️ Send me any file and I will give you a **shortened link** to share.\n"
+        "➡️ Users can download only after joining required channels.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True
+    )
+# ---------------------- Membership Plans ----------------------
+
+@Client.on_message(filters.command("plans") & filters.private)
+async def plans_cmd(client: Client, message: Message):
+    user = message.from_user
+
+    # Force-subscribe check
+    if not await check_force_sub(client, user.id):
+        text, markup = await force_sub_message()
+        return await message.reply_text(text, reply_markup=markup)
+
+    buttons = [
+        [
+            InlineKeyboardButton("💳 1 Month - ₹99", callback_data="plan_1m"),
+            InlineKeyboardButton("💳 3 Months - ₹249", callback_data="plan_3m")
+        ],
+        [
+            InlineKeyboardButton("💳 6 Months - ₹449", callback_data="plan_6m"),
+            InlineKeyboardButton("💳 12 Months - ₹799", callback_data="plan_12m")
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
+    ]
+
+    await message.reply_text(
+        "**💎 Premium Membership Plans 💎**\n\n"
+        "✅ Access all stored files without ads.\n"
+        "✅ No waiting time.\n"
+        "✅ Faster link access.\n\n"
+        "**Choose your plan below 👇**",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-@Client.on_message(filters.command("help") & filters.private)
-async def help_cmd(client: Client, message: Message):
-    text = (
-        "**📚 Help Menu**\n\n"
-        "➤ /start - Start the bot\n"
-        "➤ /plans - View premium plans\n"
-        "➤ /id - Get your Telegram ID\n"
-        "➤ /broadcast - Broadcast message (Owner only)\n"
-        "➤ /add_premium <days> - Add premium to user (Owner only)\n"
-        "➤ /remove_premium - Remove user from premium (Owner only)\n"
-    )
+# ---------------------- Buy Premium Callback ----------------------
 
-    await message.reply_text(text)
+@Client.on_callback_query(filters.regex("^buy_premium$"))
+async def cb_buy_premium(client: Client, query: CallbackQuery):
+    user = query.from_user
 
-
-@Client.on_message(filters.command("plans") & filters.private)
-async def plans_cmd(client: Client, message: Message):
-    await send_premium_plans(client, message)
-
-
-@Client.on_message(filters.command("id") & filters.private)
-async def id_cmd(client: Client, message: Message):
-    await message.reply_text(
-        f"👤 Your ID: `{message.from_user.id}`"
-    )
-
-
-# ---------------------- Premium Management ----------------------
-
-@Client.on_message(filters.command("add_premium") & filters.private)
-async def add_premium_cmd(client: Client, message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.reply_text("❌ You are not authorized.")
-
-    try:
-        args = message.text.split()
-        user_id = int(args[1])
-        days = int(args[2])
-    except Exception:
-        return await message.reply_text("Usage: `/add_premium user_id days`")
-
-    expire_date = datetime.now() + timedelta(days=days)
-    await add_premium_user(user_id, expire_date)
-
-    await message.reply_text(
-        f"✅ Premium activated for `{user_id}` for {days} days."
-    )
-    try:
-        await client.send_message(
-            user_id,
-            f"🎉 You have been upgraded to **Premium** for {days} days!"
-        )
-    except Exception:
-        pass
-
-
-@Client.on_message(filters.command("remove_premium") & filters.private)
-async def remove_premium_cmd(client: Client, message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.reply_text("❌ You are not authorized.")
-
-    try:
-        args = message.text.split()
-        user_id = int(args[1])
-    except Exception:
-        return await message.reply_text("Usage: `/remove_premium user_id`")
-
-    await remove_premium_user(user_id)
-    await message.reply_text(f"✅ Premium removed from `{user_id}`")
-    try:
-        await client.send_message(
-            user_id,
-            "⚠️ Your premium membership has been removed."
-        )
-    except Exception:
-        pass
-# ---------------------- Payment & Proof System ----------------------
-
-@Client.on_callback_query(filters.regex("^show_plans$"))
-async def show_plans_cb(client: Client, query: CallbackQuery):
-    await query.message.delete()
-    await send_premium_plans(client, query.message)
-
-
-async def send_premium_plans(client, message):
-    plans_text = (
-        "**💎 Premium Membership Plans**\n\n"
-        "➡️ 30 Days - ₹99\n"
-        "➡️ 90 Days - ₹249\n"
-        "➡️ 180 Days - ₹449\n\n"
-        "⚡ Pay via UPI QR below & send proof"
-    )
-
+    # Membership chart + screenshot share button
     buttons = [
-        [InlineKeyboardButton("📤 Share Screenshot", url=f"https://t.me/{OWNER_USERNAME}")],
-        [InlineKeyboardButton("✅ I Have Paid", callback_data="paid_done")]
+        [
+            InlineKeyboardButton("💳 1 Month - ₹99", callback_data="plan_1m"),
+            InlineKeyboardButton("💳 3 Months - ₹249", callback_data="plan_3m")
+        ],
+        [
+            InlineKeyboardButton("💳 6 Months - ₹449", callback_data="plan_6m"),
+            InlineKeyboardButton("💳 12 Months - ₹799", callback_data="plan_12m")
+        ],
+        [InlineKeyboardButton("📸 Share Screenshot", url=f"https://t.me/{PAYMENT_PROOF_USERNAME}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
     ]
 
-    try:
-        await message.reply_photo(
-            photo=UPI_QR_CODE,
-            caption=plans_text,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    except Exception:
-        await message.reply_text(
-            plans_text,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-
-
-@Client.on_callback_query(filters.regex("^paid_done$"))
-async def paid_done_cb(client: Client, query: CallbackQuery):
-    await query.answer("📤 Please send payment screenshot to admin", show_alert=True)
-
-
-# ---------------------- Proof Channel Logger ----------------------
-
-@Client.on_message(filters.photo & filters.private)
-async def payment_proof_handler(client: Client, message: Message):
-    user = message.from_user
-    caption = (
-        f"🧾 **Payment Proof Received**\n\n"
-        f"👤 User: {user.mention}\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    await query.message.edit_text(
+        "**💎 Premium Membership Plans 💎**\n\n"
+        "📌 After payment, click 'Share Screenshot' to send payment proof.\n\n"
+        "✅ UPI ID: `{}`\n".format(UPI_ID) +
+        ("✅ Extra Info: {}\n".format(PAYMENT_INFO) if PAYMENT_INFO else ""),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        disable_web_page_preview=True
     )
+# ---------------------- Plan Selection ----------------------
 
-    if PROOF_CHANNEL:
-        try:
-            await client.send_photo(
-                chat_id=PROOF_CHANNEL,
-                photo=message.photo.file_id,
-                caption=caption
-            )
-        except Exception as e:
-            print("Error sending proof:", e)
+@Client.on_callback_query(filters.regex("^plan_"))
+async def cb_plan_select(client: Client, query: CallbackQuery):
+    plan = query.data.split("_")[1]  # 1m, 3m, 6m, 12m
+    user = query.from_user
 
-    try:
-        await client.send_message(
-            OWNER_ID,
-            f"📤 {user.mention} ne payment proof bheja hai. Check karo!"
-        )
-    except Exception:
-        pass
+    prices = {
+        "1m": "₹99 (1 Month)",
+        "3m": "₹249 (3 Months)",
+        "6m": "₹449 (6 Months)",
+        "12m": "₹799 (12 Months)"
+    }
 
-    await message.reply_text(
-        "✅ Screenshot received!\n\n"
-        "⏳ Admin will verify & activate your premium soon."
-    )
-# ---------------------- Broadcast System ----------------------
+    price_text = prices.get(plan, "Unknown Plan")
 
-BROADCAST_USERS = set()
+    buttons = [
+        [InlineKeyboardButton("📸 Share Screenshot", url=f"https://t.me/{PAYMENT_PROOF_USERNAME}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="buy_premium")]
+    ]
 
-@Client.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
-async def broadcast_handler(client: Client, message: Message):
-    if not message.reply_to_message:
-        return await message.reply_text("❌ Reply to a message to broadcast.")
-
-    sent = 0
-    failed = 0
-
-    async for user in db.get_all_users():
-        try:
-            await message.reply_to_message.copy(user["user_id"])
-            sent += 1
-            await asyncio.sleep(0.2)  # prevent flood
-        except Exception:
-            failed += 1
-            continue
-
-    await message.reply_text(f"✅ Broadcast done!\n\n📤 Sent: {sent}\n❌ Failed: {failed}")
-
-
-# ---------------------- User Info / ID Command ----------------------
-
-@Client.on_message(filters.command("id"))
-async def id_cmd(client: Client, message: Message):
-    if message.reply_to_message:
-        user = message.reply_to_message.from_user
-        await message.reply_text(
-            f"👤 Name: {user.mention}\n🆔 ID: `{user.id}`"
-        )
-    else:
-        await message.reply_text(
-            f"👤 Name: {message.from_user.mention}\n🆔 ID: `{message.from_user.id}`"
-        )
-
-
-# ---------------------- Ban / Unban Users ----------------------
-
-BANNED_USERS = set()
-
-@Client.on_message(filters.command("ban") & filters.user(OWNER_ID))
-async def ban_user(client: Client, message: Message):
-    if not message.reply_to_message:
-        return await message.reply_text("❌ Reply to a user to ban.")
-
-    user = message.reply_to_message.from_user
-    BANNED_USERS.add(user.id)
-    await db.ban_user(user.id)
-    await message.reply_text(f"🚫 {user.mention} banned successfully.")
-
-
-@Client.on_message(filters.command("unban") & filters.user(OWNER_ID))
-async def unban_user(client: Client, message: Message):
-    if not message.reply_to_message:
-        return await message.reply_text("❌ Reply to a user to unban.")
-
-    user = message.reply_to_message.from_user
-    if user.id in BANNED_USERS:
-        BANNED_USERS.remove(user.id)
-    await db.unban_user(user.id)
-    await message.reply_text(f"✅ {user.mention} unbanned successfully.")
-
-
-# ---------------------- Add / Remove Filters ----------------------
-
-@Client.on_message(filters.command("add_filter") & filters.user(OWNER_ID))
-async def add_filter(client: Client, message: Message):
-    if len(message.command) < 3:
-        return await message.reply_text("Usage: /add_filter keyword reply_text")
-
-    keyword = message.command[1].lower()
-    reply_text = " ".join(message.command[2:])
-    await db.add_filter(keyword, reply_text)
-    await message.reply_text(f"✅ Filter added for **{keyword}**")
-
-
-@Client.on_message(filters.command("del_filter") & filters.user(OWNER_ID))
-async def del_filter(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text("Usage: /del_filter keyword")
-
-    keyword = message.command[1].lower()
-    await db.del_filter(keyword)
-    await message.reply_text(f"❌ Filter removed for **{keyword}**")
-
-
-@Client.on_message(filters.command("filters"))
-async def list_filters(client: Client, message: Message):
-    filters_list = await db.list_filters()
-    if not filters_list:
-        return await message.reply_text("No filters found.")
-
-    text = "**📑 Current Filters:**\n\n"
-    for f in filters_list:
-        text += f"• `{f['keyword']}` → {f['reply_text'][:30]}...\n"
-
-    await message.reply_text(text)
-# ---------------------- Search System with Pagination ----------------------
-
-SEARCH_DATA = {}  # user_id: { "results": [], "page": 0 }
-
-RESULTS_PER_PAGE = 10
-
-
-@Client.on_message(filters.command("search"))
-async def search_files(client: Client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text("Usage: /search keyword")
-
-    query = " ".join(message.command[1:]).lower()
-    results = await db.search_files(query)
-
-    if not results:
-        return await message.reply_text("❌ No results found.")
-
-    SEARCH_DATA[message.from_user.id] = {"results": results, "page": 0}
-    await send_search_page(client, message.chat.id, message.from_user.id)
-
-
-async def send_search_page(client, chat_id, user_id):
-    data = SEARCH_DATA.get(user_id)
-    if not data:
-        return
-
-    results = data["results"]
-    page = data["page"]
-
-    start = page * RESULTS_PER_PAGE
-    end = start + RESULTS_PER_PAGE
-    current_results = results[start:end]
-
-    text = f"🔍 **Search Results (Page {page+1})**\n\n"
-    buttons = []
-
-    for r in current_results:
-        text += f"📂 {r['file_name']} ({r['file_size']})\n"
-        buttons.append([InlineKeyboardButton(r['file_name'][:25], callback_data=f"get_{r['file_id']}")])
-
-    nav_btns = []
-    if page > 0:
-        nav_btns.append(InlineKeyboardButton("⬅️ Prev", callback_data="prev"))
-    if end < len(results):
-        nav_btns.append(InlineKeyboardButton("Next ➡️", callback_data="next"))
-
-    if nav_btns:
-        buttons.append(nav_btns)
-
-    buttons.append([InlineKeyboardButton("❌ Close", callback_data="close")])
-
-    await client.send_message(
-        chat_id,
-        text,
+    await query.message.edit_text(
+        f"**💎 Selected Plan:** {price_text}\n\n"
+        "✅ UPI ID: `{}`\n".format(UPI_ID) +
+        ("✅ Extra Info: {}\n\n".format(PAYMENT_INFO) if PAYMENT_INFO else "\n") +
+        "📌 Please complete the payment and click **Share Screenshot** button below "
+        "to send payment proof.",
         reply_markup=InlineKeyboardMarkup(buttons),
         disable_web_page_preview=True
     )
 
 
-# ---------------------- Callback Query for Pagination + File Fetch ----------------------
+# ---------------------- Payment Screenshot Handler ----------------------
 
-@Client.on_callback_query()
-async def callback_handler(client: Client, query: CallbackQuery):
-    user_id = query.from_user.id
-    data = query.data
+@Client.on_message(filters.private & filters.photo)
+async def payment_screenshot_handler(client: Client, message: Message):
+    user_id = message.from_user.id
 
-    if data == "next":
-        SEARCH_DATA[user_id]["page"] += 1
-        await query.message.delete()
-        await send_search_page(client, query.message.chat.id, user_id)
+    if not ALLOW_SCREENSHOT_SHARE:
+        return
 
-    elif data == "prev":
-        SEARCH_DATA[user_id]["page"] -= 1
-        await query.message.delete()
-        await send_search_page(client, query.message.chat.id, user_id)
+    caption = (
+        f"📸 **Payment Proof Received**\n\n"
+        f"👤 User: `{user_id}`\n"
+        f"Username: @{message.from_user.username if message.from_user.username else 'N/A'}\n"
+        f"Name: {message.from_user.first_name}\n\n"
+        "⚠️ Please verify manually and update premium status."
+    )
 
-    elif data == "close":
-        await query.message.delete()
-        SEARCH_DATA.pop(user_id, None)
-
-    elif data.startswith("get_"):
-        file_id = data.split("_", 1)[1]
-        file = await db.get_file_by_id(file_id)
-
-        if not file:
-            return await query.answer("❌ File not found in DB.", show_alert=True)
-
-        await client.send_cached_media(
-            chat_id=query.message.chat.id,
-            file_id=file["file_id"],
-            caption=f"📂 **{file['file_name']}**\n\n💾 Size: {file['file_size']}"
+    try:
+        await client.send_photo(
+            chat_id=f"@{PAYMENT_PROOF_USERNAME}",
+            photo=message.photo.file_id,
+            caption=caption
         )
-        await query.answer("✅ File sent!", show_alert=False)
+        await message.reply_text("✅ Screenshot received! Please wait for verification.")
+    except Exception as e:
+        logger.error(f"Failed to forward screenshot: {e}")
+        await message.reply_text("❌ Failed to forward screenshot. Please try again.")
+# ---------------------- Admin: Approve / Reject Payments ----------------------
+
+@Client.on_message(filters.command("approve") & filters.user(OWNER_ID))
+async def approve_payment(client: Client, message: Message):
+    try:
+        if len(message.command) < 3:
+            await message.reply_text("⚠️ Usage: `/approve user_id days`")
+            return
+
+        user_id = int(message.command[1])
+        days = int(message.command[2])
+
+        expiry = datetime.utcnow() + timedelta(days=days)
+        await add_premium_user(user_id, expiry)
+
+        try:
+            await client.send_message(
+                user_id,
+                f"🎉 Congratulations! You are now a **Premium User**.\n\n"
+                f"✅ Valid till: `{expiry.strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't notify user {user_id}: {e}")
+
+        await message.reply_text(f"✅ Approved premium for `{user_id}` till {expiry}")
+    except Exception as e:
+        logger.error(f"Approve error: {e}")
+        await message.reply_text("❌ Something went wrong while approving.")
 
 
-# ---------------------- PM Search Results ----------------------
+@Client.on_message(filters.command("reject") & filters.user(OWNER_ID))
+async def reject_payment(client: Client, message: Message):
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("⚠️ Usage: `/reject user_id`")
+            return
 
-@Client.on_message(filters.private & filters.text)
-async def pm_search_handler(client: Client, message: Message):
-    if message.from_user.id in BANNED_USERS:
-        return await message.reply_text("🚫 You are banned from using this bot.")
+        user_id = int(message.command[1])
+        try:
+            await client.send_message(
+                user_id,
+                "❌ Your premium request has been rejected.\n"
+                "📌 Please contact admin if you think this is a mistake."
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't notify rejected user {user_id}: {e}")
 
-    query = message.text.lower()
-    results = await db.search_files(query)
+        await message.reply_text(f"❌ Rejected premium request for `{user_id}`")
+    except Exception as e:
+        logger.error(f"Reject error: {e}")
+        await message.reply_text("❌ Something went wrong while rejecting.")
 
-    if not results:
-        return await message.reply_text("❌ No results found.")
 
-    SEARCH_DATA[message.from_user.id] = {"results": results, "page": 0}
-    await send_search_page(client, message.chat.id, message.from_user.id)
+# ---------------------- Check Premium Status ----------------------
+
+@Client.on_message(filters.command("premium"))
+async def premium_status(client: Client, message: Message):
+    user_id = message.from_user.id
+    premium = await get_premium_user(user_id)
+
+    if not premium:
+        await message.reply_text("⏳ You are not a premium user.\n\nUse /buy to upgrade.")
+        return
+
+    expiry = premium.get("expiry")
+    await message.reply_text(
+        f"💎 You are a **Premium User**.\n\n"
+        f"✅ Valid till: `{expiry}`"
+    )
+
+
+# ---------------------- Revoke Premium ----------------------
+
+@Client.on_message(filters.command("remove_premium") & filters.user(OWNER_ID))
+async def remove_premium(client: Client, message: Message):
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("⚠️ Usage: `/remove_premium user_id`")
+            return
+
+        user_id = int(message.command[1])
+        await remove_premium_user(user_id)
+
+        try:
+            await client.send_message(
+                user_id,
+                "⚠️ Your premium membership has been revoked by admin."
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't notify removed user {user_id}: {e}")
+
+        await message.reply_text(f"✅ Removed premium for `{user_id}`")
+    except Exception as e:
+        logger.error(f"Remove premium error: {e}")
+        await message.reply_text("❌ Something went wrong while removing premium.")
