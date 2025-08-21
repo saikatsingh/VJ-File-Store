@@ -1,376 +1,538 @@
-# ---------------------- Imports ----------------------
+plugins/commands.py
+
+# Don't Remove Credit Tg - @VJ_Botz
+# Subscribe YouTube Channel For Amazing Bot https://youtube.com/@Tech_VJ
+# Ask Doubt on telegram @KingVJ01
+
 import os
+import logging
+import random
 import asyncio
-from datetime import datetime, timedelta
+from validators import domain
+from Script import script
+from plugins.dbusers import db
+from pyrogram import Client, filters, enums
+from plugins.users_api import get_user, update_user_info
+from pyrogram.errors import ChatAdminRequired, FloodWait, UserNotParticipant
+from pyrogram.types import *
+from utils import verify_user, check_token, check_verification, get_token
+from config import *
+import re
+import json
+import base64
+from urllib.parse import quote_plus
+from TechVJ.utils.file_properties import get_name, get_hash, get_media_file_size
 
-from pyrogram import Client, filters
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+logger = logging.getLogger(__name__)
 
-# Database & utils
-from database.ia_filterdb import Media, Media2, Media3, Media4
-from database.users_chats_db import db
-from info import (
-    OWNER_ID, OWNER_USERNAME, BOT_USERNAME,
-    LOG_CHANNEL, UPI_ID, PAYMENT_INFO, PAYMENT_QR,
-    ALLOW_SCREENSHOT_SHARE, PAYMENT_PROOF_USERNAME,
-    PROOF_CHANNEL, FORCE_SUB_CHANNELS, SHORTLINK_API, SHORTLINK_URL,
-)
-from utils import get_shortlink, verify_user_token
+BATCH_FILES = {}
 
+# ------------- Multi Force-Subscribe Helper -------------
+# REQUIRED in config.py:
+# FORCE_SUB_CHANNELS = [int(x) for x in environ.get("FORCE_SUB_CHANNELS", "").split()]
+# OPTIONAL in config.py:
+# FSUB_TEXT = environ.get("FSUB_TEXT", "⚠️ Pehle niche wale channels join karo, phir 'Refresh' dabao.")
+FSUB_TEXT = globals().get("FSUB_TEXT", "⚠️ Please join all required channels first and then press Refresh.")
 
-# ---------------------- Helper Functions ----------------------
-
-def is_owner(user_id: int) -> bool:
-    """Check if the given user is the bot owner"""
-    return user_id == OWNER_ID
-
-
-def format_timedelta(td: timedelta) -> str:
-    """Convert timedelta to human-readable string"""
-    days = td.days
-    hours, remainder = divmod(td.seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-    if days > 0:
-        return f"{days}d {hours}h {minutes}m"
-    elif hours > 0:
-        return f"{hours}h {minutes}m"
-    else:
-        return f"{minutes}m"
-
-
-async def send_premium_plans(client: Client, message: Message):
-    """Send premium membership plans with UPI + screenshot proof button"""
-    buttons = [
-        [InlineKeyboardButton("💎 1 Month - ₹99", callback_data="buy_30")],
-        [InlineKeyboardButton("💎 3 Months - ₹249", callback_data="buy_90")],
-        [InlineKeyboardButton("💎 1 Year - ₹799", callback_data="buy_365")],
-        [InlineKeyboardButton("📤 Pay Now (UPI)", url=f"upi://pay?pa={UPI_ID}&pn=FileStoreBot")]
-    ]
-
-    # Screenshot proof button
-    if ALLOW_SCREENSHOT_SHARE and PAYMENT_PROOF_USERNAME:
-        buttons.append(
-            [InlineKeyboardButton("📤 Share Screenshot", url=f"https://t.me/{PAYMENT_PROOF_USERNAME}")]
-        )
-
-    caption = (
-        "💎 **Premium Membership Plans** 💎\n\n"
-        f"{PAYMENT_INFO}\n\n"
-        "✅ Pay via UPI / QR\n"
-        "✅ Send screenshot as proof\n"
-        "✅ Admin will activate your premium"
-    )
-
-    if PAYMENT_QR:
-        await message.reply_photo(
-            photo=PAYMENT_QR,
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await message.reply_text(
-            caption,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-# ---------------------- Force Subscribe Helper ----------------------
-
-async def check_force_sub(client: Client, user_id: int) -> bool:
+async def _safe_invite_link(client: Client, channel_id: int):
     """
-    Check if user has joined all required channels.
-    Returns True if joined, False if not.
+    Try to get an invite link. If export fails (bot not admin) but channel is public,
+    fallback to https://t.me/username. If nothing works, returns None.
     """
     try:
-        if not FORCE_SUB_CHANNELS:
-            return True
-
-        for channel in FORCE_SUB_CHANNELS:
-            try:
-                member = await client.get_chat_member(channel, user_id)
-                if member.status in ["kicked", "banned"]:
-                    return False
-            except Exception:
-                return False
-        return True
+        chat = await client.get_chat(channel_id)
+        # if invite_link already exists
+        if chat.invite_link:
+            return chat.title, chat.invite_link
+        # try exporting (requires admin)
+        try:
+            link = await client.export_chat_invite_link(channel_id)
+            return chat.title, link
+        except Exception:
+            # fallback to public @username link
+            if chat.username:
+                return chat.title, f"https://t.me/{chat.username}"
+            return chat.title, None
     except Exception:
-        return False
+        return "Channel", None
 
+async def check_force_subscribe(client: Client, user_id: int):
+    """
+    Checks if user joined ALL FORCE_SUB_CHANNELS.
+    Returns (True, None) if all joined.
+    Else returns (False, InlineKeyboardMarkup) with join buttons + refresh.
+    """
+    channels = []
+    need_join = []
 
-async def force_sub_message():
-    """Generate force-subscribe message with join buttons"""
-    buttons = []
-    for channel in FORCE_SUB_CHANNELS:
-        buttons.append([InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel.lstrip('@')}")])
-    buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="check_fsub")])
+    # If no channels configured, allow.
+    fsubs = globals().get("FORCE_SUB_CHANNELS", [])
+    if not fsubs:
+        return True, None
 
-    return "🚨 **You must join our channels to use this bot!**", InlineKeyboardMarkup(buttons)
+    # collect channel info and membership
+    for ch_id in fsubs:
+        title, link = await _safe_invite_link(client, ch_id)
+        channels.append((ch_id, title, link))
+        try:
+            member = await client.get_chat_member(ch_id, user_id)
+            if getattr(member, "status", "") in ["kicked"]:
+                # kicked users are considered not allowed
+                need_join.append((ch_id, title, link))
+            # left users raise UserNotParticipant usually,
+            # but handle explicitly if API returns "left"
+            if getattr(member, "status", "") in ["left"]:
+                need_join.append((ch_id, title, link))
+        except UserNotParticipant:
+            need_join.append((ch_id, title, link))
+        except Exception:
+            # if we can't verify, be safe and ask to join
+            need_join.append((ch_id, title, link))
 
+    if not need_join:
+        return True, None
 
-# ---------------------- /start Command ----------------------
-
-@Client.on_message(filters.command("start") & filters.private)
-async def start_cmd(client: Client, message: Message):
-    user = message.from_user
-
-    # Save user in DB
-    await db.add_user(user.id, user.first_name)
-
-    # Force-subscribe check
-    if not await check_force_sub(client, user.id):
-        text, markup = await force_sub_message()
-        return await message.reply_text(text, reply_markup=markup)
-
-    # If user used token link
-    if len(message.command) > 1:
-        token = message.command[1]
-        file_id = await verify_user_token(token, user.id)
-        if file_id:
-            file = await Media.find_one({"file_id": file_id})
-            if not file:
-                file = await Media2.find_one({"file_id": file_id})
-            if not file:
-                file = await Media3.find_one({"file_id": file_id})
-            if not file:
-                file = await Media4.find_one({"file_id": file_id})
-
-            if file:
-                try:
-                    return await message.reply_cached_media(
-                        file.file_id,
-                        caption=file.caption or ""
-                    )
-                except Exception:
-                    return await message.reply_text("⚠️ File not found.")
+    # build buttons: one row per channel
+    rows = []
+    for _, title, link in need_join:
+        if link:
+            rows.append([InlineKeyboardButton(f"Join {title}", url=link)])
         else:
-            return await message.reply_text("❌ Invalid or expired link.")
+            # if link is None, show disabled text button + ask admin to add bot as admin to export link
+            rows.append([InlineKeyboardButton(f"Join {title} (link unavailable)", url="https://t.me/")])
 
-    # Default start message
-    buttons = [
-        [InlineKeyboardButton("💎 Buy Premium", callback_data="buy_premium")],
-        [InlineKeyboardButton("📢 Updates", url=f"https://t.me/{FORCE_SUB_CHANNELS[0].lstrip('@')}")],
-    ]
-
-    await message.reply_text(
-        f"👋 Hello {user.mention},\n\n"
-        "I am your **File Store Bot** 📂.\n\n"
-        "➡️ Send me any file and I will give you a **shortened link** to share.\n"
-        "➡️ Users can download only after joining required channels.",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True
-    )
-# ---------------------- Membership Plans ----------------------
-
-@Client.on_message(filters.command("plans") & filters.private)
-async def plans_cmd(client: Client, message: Message):
-    user = message.from_user
-
-    # Force-subscribe check
-    if not await check_force_sub(client, user.id):
-        text, markup = await force_sub_message()
-        return await message.reply_text(text, reply_markup=markup)
-
-    buttons = [
-        [
-            InlineKeyboardButton("💳 1 Month - ₹99", callback_data="plan_1m"),
-            InlineKeyboardButton("💳 3 Months - ₹249", callback_data="plan_3m")
-        ],
-        [
-            InlineKeyboardButton("💳 6 Months - ₹449", callback_data="plan_6m"),
-            InlineKeyboardButton("💳 12 Months - ₹799", callback_data="plan_12m")
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
-    ]
-
-    await message.reply_text(
-        "**💎 Premium Membership Plans 💎**\n\n"
-        "✅ Access all stored files without ads.\n"
-        "✅ No waiting time.\n"
-        "✅ Faster link access.\n\n"
-        "**Choose your plan below 👇**",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    # refresh row
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_fsub")])
+    return False, InlineKeyboardMarkup(rows)
+# ------------- /Multi Force-Subscribe Helper -------------
 
 
-# ---------------------- Buy Premium Callback ----------------------
+def get_size(size):
+    """Get size in readable format"""
 
-@Client.on_callback_query(filters.regex("^buy_premium$"))
-async def cb_buy_premium(client: Client, query: CallbackQuery):
-    user = query.from_user
+    units = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB"]
+    size = float(size)
+    i = 0
+    while size >= 1024.0 and i < len(units):
+        i += 1
+        size /= 1024.0
+    return "%.2f %s" % (size, units[i])
 
-    # Membership chart + screenshot share button
-    buttons = [
-        [
-            InlineKeyboardButton("💳 1 Month - ₹99", callback_data="plan_1m"),
-            InlineKeyboardButton("💳 3 Months - ₹249", callback_data="plan_3m")
-        ],
-        [
-            InlineKeyboardButton("💳 6 Months - ₹449", callback_data="plan_6m"),
-            InlineKeyboardButton("💳 12 Months - ₹799", callback_data="plan_12m")
-        ],
-        [InlineKeyboardButton("📸 Share Screenshot", url=f"https://t.me/{PAYMENT_PROOF_USERNAME}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_home")]
-    ]
-
-    await query.message.edit_text(
-        "**💎 Premium Membership Plans 💎**\n\n"
-        "📌 After payment, click 'Share Screenshot' to send payment proof.\n\n"
-        "✅ UPI ID: `{}`\n".format(UPI_ID) +
-        ("✅ Extra Info: {}\n".format(PAYMENT_INFO) if PAYMENT_INFO else ""),
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True
-    )
-# ---------------------- Plan Selection ----------------------
-
-@Client.on_callback_query(filters.regex("^plan_"))
-async def cb_plan_select(client: Client, query: CallbackQuery):
-    plan = query.data.split("_")[1]  # 1m, 3m, 6m, 12m
-    user = query.from_user
-
-    prices = {
-        "1m": "₹99 (1 Month)",
-        "3m": "₹249 (3 Months)",
-        "6m": "₹449 (6 Months)",
-        "12m": "₹799 (12 Months)"
-    }
-
-    price_text = prices.get(plan, "Unknown Plan")
-
-    buttons = [
-        [InlineKeyboardButton("📸 Share Screenshot", url=f"https://t.me/{PAYMENT_PROOF_USERNAME}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="buy_premium")]
-    ]
-
-    await query.message.edit_text(
-        f"**💎 Selected Plan:** {price_text}\n\n"
-        "✅ UPI ID: `{}`\n".format(UPI_ID) +
-        ("✅ Extra Info: {}\n\n".format(PAYMENT_INFO) if PAYMENT_INFO else "\n") +
-        "📌 Please complete the payment and click **Share Screenshot** button below "
-        "to send payment proof.",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True
-    )
+def formate_file_name(file_name):
+    chars = ["[", "]", "(", ")"]
+    for c in chars:
+        file_name.replace(c, "")
+    file_name = '@VJ_Botz ' + ' '.join(filter(lambda x: not x.startswith('http') and not x.startswith('@') and not x.startswith('www.'), file_name.split()))
+    return file_name
 
 
-# ---------------------- Payment Screenshot Handler ----------------------
+@Client.on_message(filters.command("start") & filters.incoming)
+async def start(client, message):
+    username = client.me.username
 
-@Client.on_message(filters.private & filters.photo)
-async def payment_screenshot_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-
-    if not ALLOW_SCREENSHOT_SHARE:
-        return
-
-    caption = (
-        f"📸 **Payment Proof Received**\n\n"
-        f"👤 User: `{user_id}`\n"
-        f"Username: @{message.from_user.username if message.from_user.username else 'N/A'}\n"
-        f"Name: {message.from_user.first_name}\n\n"
-        "⚠️ Please verify manually and update premium status."
-    )
-
-    try:
-        await client.send_photo(
-            chat_id=f"@{PAYMENT_PROOF_USERNAME}",
-            photo=message.photo.file_id,
-            caption=caption
+    # ---- Force-Subscribe check (start pe mandatory) ----
+    ok, kb = await check_force_subscribe(client, message.from_user.id)
+    if not ok:
+        return await message.reply_text(
+            FSUB_TEXT,
+            reply_markup=kb,
+            disable_web_page_preview=True
         )
-        await message.reply_text("✅ Screenshot received! Please wait for verification.")
-    except Exception as e:
-        logger.error(f"Failed to forward screenshot: {e}")
-        await message.reply_text("❌ Failed to forward screenshot. Please try again.")
-# ---------------------- Admin: Approve / Reject Payments ----------------------
+    # -----------------------------------------------------
 
-@Client.on_message(filters.command("approve") & filters.user(OWNER_ID))
-async def approve_payment(client: Client, message: Message):
+    if not await db.is_user_exist(message.from_user.id):
+        await db.add_user(message.from_user.id, message.from_user.first_name)
+        await client.send_message(LOG_CHANNEL, script.LOG_TEXT.format(message.from_user.id, message.from_user.mention))
+
+    if len(message.command) != 2:
+        buttons = [[
+            InlineKeyboardButton('💝 sᴜʙsᴄʀɪʙᴇ ᴍʏ ʏᴏᴜᴛᴜʙᴇ ᴄʜᴀɴɴᴇʟ', url='https://youtube.com/@Tech_VJ')
+            ],[
+            InlineKeyboardButton('🔍 sᴜᴘᴘᴏʀᴛ ɢʀᴏᴜᴘ', url='https://t.me/vj_bot_disscussion'),
+            InlineKeyboardButton('🤖 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/vj_botz')
+            ],[
+            InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
+        ]]
+        if CLONE_MODE == True:
+            buttons.append([InlineKeyboardButton('🤖 ᴄʀᴇᴀᴛᴇ ʏᴏᴜʀ ᴏᴡɴ ᴄʟᴏɴᴇ ʙᴏᴛ', callback_data='clone')])
+        reply_markup = InlineKeyboardMarkup(buttons)
+        me = client.me
+        await message.reply_photo(
+            photo=random.choice(PICS),
+            caption=script.START_TXT.format(message.from_user.mention, me.mention),
+            reply_markup=reply_markup
+        )
+        return
+    
+    # deep-link or file token path
+    data = message.command[1]
     try:
-        if len(message.command) < 3:
-            await message.reply_text("⚠️ Usage: `/approve user_id days`")
-            return
+        pre, file_id = data.split('_', 1)
+    except:
+        file_id = data
+        pre = ""
 
-        user_id = int(message.command[1])
-        days = int(message.command[2])
+    if data.split("-", 1)[0] == "verify":
+        userid = data.split("-", 2)[1]
+        token = data.split("-", 3)[2]
+        if str(message.from_user.id) != str(userid):
+            return await message.reply_text(
+                text="<b>Invalid link or Expired link !</b>",
+                protect_content=True
+            )
+        is_valid = await check_token(client, userid, token)
+        if is_valid == True:
+            await message.reply_text(
+                text=f"<b>Hey {message.from_user.mention}, You are successfully verified !\nNow you have unlimited access for all files till today midnight.</b>",
+                protect_content=True
+            )
+            await verify_user(client, userid, token)
+        else:
+            return await message.reply_text(
+                text="<b>Invalid link or Expired link !</b>",
+                protect_content=True
+            )
 
-        expiry = datetime.utcnow() + timedelta(days=days)
-        await add_premium_user(user_id, expiry)
+    elif data.split("-", 1)[0] == "BATCH":
+        # ---- Force-Subscribe check for batch files ----
+        ok, kb = await check_force_subscribe(client, message.from_user.id)
+        if not ok:
+            return await message.reply_text(
+                FSUB_TEXT,
+                reply_markup=kb,
+                disable_web_page_preview=True
+            )
+        # ------------------------------------------------
 
         try:
-            await client.send_message(
-                user_id,
-                f"🎉 Congratulations! You are now a **Premium User**.\n\n"
-                f"✅ Valid till: `{expiry.strftime('%Y-%m-%d %H:%M:%S')}`"
-            )
+            if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+                btn = [[
+                    InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
+                ],[
+                    InlineKeyboardButton("How To Open Link & Verify", url=VERIFY_TUTORIAL)
+                ]]
+                await message.reply_text(
+                    text="<b>You are not verified !\nKindly verify to continue !</b>",
+                    protect_content=True,
+                    reply_markup=InlineKeyboardMarkup(btn)
+                )
+                return
         except Exception as e:
-            logger.warning(f"Couldn't notify user {user_id}: {e}")
+            return await message.reply_text(f"**Error - {e}**")
 
-        await message.reply_text(f"✅ Approved premium for `{user_id}` till {expiry}")
-    except Exception as e:
-        logger.error(f"Approve error: {e}")
-        await message.reply_text("❌ Something went wrong while approving.")
-
-
-@Client.on_message(filters.command("reject") & filters.user(OWNER_ID))
-async def reject_payment(client: Client, message: Message):
-    try:
-        if len(message.command) < 2:
-            await message.reply_text("⚠️ Usage: `/reject user_id`")
-            return
-
-        user_id = int(message.command[1])
-        try:
-            await client.send_message(
-                user_id,
-                "❌ Your premium request has been rejected.\n"
-                "📌 Please contact admin if you think this is a mistake."
-            )
-        except Exception as e:
-            logger.warning(f"Couldn't notify rejected user {user_id}: {e}")
-
-        await message.reply_text(f"❌ Rejected premium request for `{user_id}`")
-    except Exception as e:
-        logger.error(f"Reject error: {e}")
-        await message.reply_text("❌ Something went wrong while rejecting.")
-
-
-# ---------------------- Check Premium Status ----------------------
-
-@Client.on_message(filters.command("premium"))
-async def premium_status(client: Client, message: Message):
-    user_id = message.from_user.id
-    premium = await get_premium_user(user_id)
-
-    if not premium:
-        await message.reply_text("⏳ You are not a premium user.\n\nUse /buy to upgrade.")
+        sts = await message.reply("**🔺 ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ**")
+        file_id = data.split("-", 1)[1]
+        msgs = BATCH_FILES.get(file_id)
+        if not msgs:
+            decode_file_id = base64.urlsafe_b64decode(file_id + "=" * (-len(file_id) % 4)).decode("ascii")
+            msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
+            media = getattr(msg, msg.media.value)
+            file_id = media.file_id
+            file = await client.download_media(file_id)
+            try: 
+                with open(file) as file_data:
+                    msgs=json.loads(file_data.read())
+            except:
+                await sts.edit("FAILED")
+                return await client.send_message(LOG_CHANNEL, "UNABLE TO OPEN FILE.")
+            os.remove(file)
+            BATCH_FILES[file_id] = msgs
+            
+        filesarr = []
+        for msg in msgs:
+            channel_id = int(msg.get("channel_id"))
+            msgid = msg.get("msg_id")
+            info = await client.get_messages(channel_id, int(msgid))
+            if info.media:
+                file_type = info.media
+                file = getattr(info, file_type.value)
+                f_caption = getattr(info, 'caption', '')
+                if f_caption:
+                    f_caption = f_caption.html
+                old_title = getattr(file, "file_name", "")
+                title = formate_file_name(old_title)
+                size=get_size(int(file.file_size))
+                if BATCH_FILE_CAPTION:
+                    try:
+                        f_caption=BATCH_FILE_CAPTION.format(file_name= '' if title is None else title, file_size='' if size is None else size, file_caption='' if f_caption is None else f_caption)
+                    except:
+                        f_caption=f_caption
+                if f_caption is None:
+                    f_caption = f"{title}"
+                if STREAM_MODE == True:
+                    if info.video or info.document:
+                        log_msg = info
+                        fileName = {quote_plus(get_name(log_msg))}
+                        stream = f"{URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+                        download = f"{URL}{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+                        button = [[
+                            InlineKeyboardButton("• ᴅᴏᴡɴʟᴏᴀᴅ •", url=download),
+                            InlineKeyboardButton('• ᴡᴀᴛᴄʜ •', url=stream)
+                        ],[
+                            InlineKeyboardButton("• ᴡᴀᴛᴄʜ ɪɴ ᴡᴇʙ ᴀᴘᴘ •", web_app=WebAppInfo(url=stream))
+                        ]]
+                        reply_markup=InlineKeyboardMarkup(button)
+                else:
+                    reply_markup = None
+                try:
+                    msg = await info.copy(chat_id=message.from_user.id, caption=f_caption, protect_content=False, reply_markup=reply_markup)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    msg = await info.copy(chat_id=message.from_user.id, caption=f_caption, protect_content=False, reply_markup=reply_markup)
+                except:
+                    continue
+            else:
+                try:
+                    msg = await info.copy(chat_id=message.from_user.id, protect_content=False)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    msg = await info.copy(chat_id=message.from_user.id, protect_content=False)
+                except:
+                    continue
+            filesarr.append(msg)
+            await asyncio.sleep(1) 
+        await sts.delete()
+        if AUTO_DELETE_MODE == True:
+            k = await client.send_message(chat_id = message.from_user.id, text=f"<b><u>❗️❗️❗️IMPORTANT❗️️❗️❗️</u></b>\n\nThis Movie File/Video will be deleted in <b><u>{AUTO_DELETE} minutes</u> 🫥 <i></b>(Due to Copyright Issues)</i>.\n\n<b><i>Please forward this File/Video to your Saved Messages and Start Download there</b>")
+            await asyncio.sleep(AUTO_DELETE_TIME)
+            for x in filesarr:
+                try:
+                    await x.delete()
+                except:
+                    pass
+            await k.edit_text("<b>Your All Files/Videos is successfully deleted!!!</b>")
         return
 
-    expiry = premium.get("expiry")
-    await message.reply_text(
-        f"💎 You are a **Premium User**.\n\n"
-        f"✅ Valid till: `{expiry}`"
-    )
+    # single file deep link
+    pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
 
+    # ---- Force-Subscribe check for single file ----
+    ok, kb = await check_force_subscribe(client, message.from_user.id)
+    if not ok:
+        return await message.reply_text(
+            FSUB_TEXT,
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+    # ------------------------------------------------
 
-# ---------------------- Revoke Premium ----------------------
+    if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+        btn = [[
+            InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
+        ],[
+            InlineKeyboardButton("How To Open Link & Verify", url=VERIFY_TUTORIAL)
+        ]]
+        await message.reply_text(
+            text="<b>You are not verified !\nKindly verify to continue !</b>",
+            protect_content=True,
+            reply_markup=InlineKeyboardMarkup(btn)
+        )
+        return
 
-@Client.on_message(filters.command("remove_premium") & filters.user(OWNER_ID))
-async def remove_premium(client: Client, message: Message):
     try:
-        if len(message.command) < 2:
-            await message.reply_text("⚠️ Usage: `/remove_premium user_id`")
-            return
+        msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
+        if msg.media:
+            media = getattr(msg, msg.media.value)
+            title = formate_file_name(media.file_name)
+            size=get_size(media.file_size)
+            f_caption = f"<code>{title}</code>"
+            if CUSTOM_FILE_CAPTION:
+                try:
+                    f_caption=CUSTOM_FILE_CAPTION.format(file_name= '' if title is None else title, file_size='' if size is None else size, file_caption='')
+                except:
+                    return
+            if STREAM_MODE == True:
+                if msg.video or msg.document:
+                    log_msg = msg
+                    fileName = {quote_plus(get_name(log_msg))}
+                    stream = f"{URL}watch/{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+                    download = f"{URL}{str(log_msg.id)}/{quote_plus(get_name(log_msg))}?hash={get_hash(log_msg)}"
+                    button = [[
+                        InlineKeyboardButton("• ᴅᴏᴡɴʟᴏᴀᴅ •", url=download),
+                        InlineKeyboardButton('• ᴡᴀᴛᴄʜ •', url=stream)
+                    ],[
+                        InlineKeyboardButton("• ᴡᴀᴛᴄʜ ɪɴ ᴡᴇʙ ᴀᴘᴘ •", web_app=WebAppInfo(url=stream))
+                    ]]
+                    reply_markup=InlineKeyboardMarkup(button)
+            else:
+                reply_markup = None
+            del_msg = await msg.copy(chat_id=message.from_user.id, caption=f_caption, reply_markup=reply_markup, protect_content=False)
+        else:
+            del_msg = await msg.copy(chat_id=message.from_user.id, protect_content=False)
+        if AUTO_DELETE_MODE == True:
+            k = await client.send_message(chat_id = message.from_user.id, text=f"<b><u>❗️❗️❗️IMPORTANT❗️️❗️❗️</u></b>\n\nThis Movie File/Video will be deleted in <b><u>{AUTO_DELETE} minutes</u> 🫥 <i></b>(Due to Copyright Issues)</i>.\n\n<b><i>Please forward this File/Video to your Saved Messages and Start Download there</b>")
+            await asyncio.sleep(AUTO_DELETE_TIME)
+            try:
+                await del_msg.delete()
+            except:
+                pass
+            await k.edit_text("<b>Your File/Video is successfully deleted!!!</b>")
+        return
+    except:
+        pass
 
-        user_id = int(message.command[1])
-        await remove_premium_user(user_id)
 
-        try:
-            await client.send_message(
-                user_id,
-                "⚠️ Your premium membership has been revoked by admin."
-            )
-        except Exception as e:
-            logger.warning(f"Couldn't notify removed user {user_id}: {e}")
+@Client.on_message(filters.command('api') & filters.private)
+async def shortener_api_handler(client, m: Message):
+    # ---- Force-Subscribe check ----
+    ok, kb = await check_force_subscribe(client, m.from_user.id)
+    if not ok:
+        return await m.reply_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+    # --------------------------------
 
-        await message.reply_text(f"✅ Removed premium for `{user_id}`")
-    except Exception as e:
-        logger.error(f"Remove premium error: {e}")
-        await message.reply_text("❌ Something went wrong while removing premium.")
+    user_id = m.from_user.id
+    user = await get_user(user_id)
+    cmd = m.command
+
+    if len(cmd) == 1:
+        s = script.SHORTENER_API_MESSAGE.format(base_site=user["base_site"], shortener_api=user["shortener_api"])
+        return await m.reply(s)
+
+    elif len(cmd) == 2:    
+        api = cmd[1].strip()
+        await update_user_info(user_id, {"shortener_api": api})
+        await m.reply("<b>Shortener API updated successfully to</b> " + api)
+
+
+@Client.on_message(filters.command("base_site") & filters.private)
+async def base_site_handler(client, m: Message):
+    # ---- Force-Subscribe check ----
+    ok, kb = await check_force_subscribe(client, m.from_user.id)
+    if not ok:
+        return await m.reply_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+    # --------------------------------
+
+    user_id = m.from_user.id
+    user = await get_user(user_id)
+    cmd = m.command
+    text = f"`/base_site (base_site)`\n\n<b>Current base site: None\n\n EX:</b> `/base_site shortnerdomain.com`\n\nIf You Want To Remove Base Site Then Copy This And Send To Bot - `/base_site None`"
+    if len(cmd) == 1:
+        return await m.reply(text=text, disable_web_page_preview=True)
+    elif len(cmd) == 2:
+        base_site = cmd[1].strip()
+        if base_site == None:
+            await update_user_info(user_id, {"base_site": base_site})
+            return await m.reply("<b>Base Site updated successfully</b>")
+            
+        if not domain(base_site):
+            return await m.reply(text=text, disable_web_page_preview=True)
+        await update_user_info(user_id, {"base_site": base_site})
+        await m.reply("<b>Base Site updated successfully</b>")
+
+
+@Client.on_callback_query()
+async def cb_handler(client: Client, query: CallbackQuery):
+    # ---- Handle Force-Subscribe refresh ----
+    if query.data == "refresh_fsub":
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if ok:
+            try:
+                await query.message.edit_text("✅ You’re all set! Ab aap bot use kar sakte ho.")
+            except Exception:
+                await query.answer("✅ Joined verified!", show_alert=True)
+        else:
+            try:
+                await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                await query.answer("⚠️ Please join all required channels.", show_alert=True)
+        return
+    # ----------------------------------------
+
+    if query.data == "close_data":
+        await query.message.delete()
+
+    elif query.data == "about":
+        buttons = [[
+            InlineKeyboardButton('Hᴏᴍᴇ', callback_data='start'),
+            InlineKeyboardButton('🔒 Cʟᴏsᴇ', callback_data='close_data')
+        ]]
+        await client.edit_message_media(
+            query.message.chat.id, 
+            query.message.id, 
+            InputMediaPhoto(random.choice(PICS))
+        )
+        reply_markup = InlineKeyboardMarkup(buttons)
+        me2 = (await client.get_me()).mention
+        await query.message.edit_text(
+            text=script.ABOUT_TXT.format(me2),
+            reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    elif query.data == "start":
+        # ---- Force-Subscribe check on start callback ----
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if not ok:
+            try:
+                return await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                return await query.answer("⚠️ Join required channels first.", show_alert=True)
+        # -------------------------------------------------
+
+        buttons = [[
+            InlineKeyboardButton('💝 sᴜʙsᴄʀɪʙᴇ ᴍʏ ʏᴏᴜᴛᴜʙᴇ ᴄʜᴀɴɴᴇʟ', url='https://youtube.com/@Tech_VJ')
+        ],[
+            InlineKeyboardButton('🔍 sᴜᴘᴘᴏʀᴛ ɢʀᴏᴜᴘ', url='https://t.me/vj_bot_disscussion'),
+            InlineKeyboardButton('🤖 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/vj_botz')
+        ],[
+            InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
+        ]]
+        if CLONE_MODE == True:
+            buttons.append([InlineKeyboardButton('🤖 ᴄʀᴇᴀᴛᴇ ʏᴏᴜʀ ᴏᴡɴ ᴄʟᴏɴᴇ ʙᴏᴛ', callback_data='clone')])
+        reply_markup = InlineKeyboardMarkup(buttons)
+        await client.edit_message_media(
+            query.message.chat.id, 
+            query.message.id, 
+            InputMediaPhoto(random.choice(PICS))
+        )
+        me2 = (await client.get_me()).mention
+        await query.message.edit_text(
+            text=script.START_TXT.format(query.from_user.mention, me2),
+            reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
+    
+    elif query.data == "clone":
+        buttons = [[
+            InlineKeyboardButton('Hᴏᴍᴇ', callback_data='start'),
+            InlineKeyboardButton('🔒 Cʟᴏsᴇ', callback_data='close_data')
+        ]]
+        await client.edit_message_media(
+            query.message.chat.id, 
+            query.message.id, 
+            InputMediaPhoto(random.choice(PICS))
+        )
+        reply_markup = InlineKeyboardMarkup(buttons)
+        await query.message.edit_text(
+            text=script.CLONE_TXT.format(query.from_user.mention),
+            reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML
+        )          
+    
+    elif query.data == "help":
+        # ---- Force-Subscribe check on help callback ----
+        ok, kb = await check_force_subscribe(client, query.from_user.id)
+        if not ok:
+            try:
+                return await query.message.edit_text(FSUB_TEXT, reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                return await query.answer("⚠️ Join required channels first.", show_alert=True)
+        # -------------------------------------------------
+
+        buttons = [[
+            InlineKeyboardButton('Hᴏᴍᴇ', callback_data='start'),
+            InlineKeyboardButton('🔒 Cʟᴏsᴇ', callback_data='close_data')
+        ]]
+        await client.edit_message_media(
+            query.message.chat.id, 
+            query.message.id, 
+            InputMediaPhoto(random.choice(PICS))
+        )
+        reply_markup = InlineKeyboardMarkup(buttons)
+        await query.message.edit_text(
+            text=script.HELP_TXT,
+            reply_markup=reply_markup,
+            parse_mode=enums.ParseMode.HTML
+        )
