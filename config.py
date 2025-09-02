@@ -23,7 +23,7 @@ BOT_TOKEN = environ.get("BOT_TOKEN", "")
 
 PICS = (environ.get('PICS', 'https://graph.org/file/46e215b0486fe8fc87a21-428e1aa05fedc39b7a.jpg')).split() # Bot Start Picture
 ADMINS = [int(admin) if id_pattern.search(admin) else admin for admin in environ.get('ADMINS', '5055129943').split()]
-BOT_USERNAME = environ.get("BOT_USERNAME", "CreazyFilestore_bot") # without @
+BOT_USERNAME = environ.get("BOT_USERNAME", "Criminal_Princess_Bot") # without @
 PORT = environ.get("PORT", "8080")
 
 # Clone Info :-
@@ -45,11 +45,11 @@ AUTO_DELETE = int(environ.get("AUTO_DELETE", "30")) # Time in Minutes
 AUTO_DELETE_TIME = int(environ.get("AUTO_DELETE_TIME", "1800")) # Time in Seconds
 
 # Channel Information
-LOG_CHANNEL = int(environ.get("LOG_CHANNEL", "-1002603703990"))
+LOG_CHANNEL = int(environ.get("LOG_CHANNEL", "-1003068328738"))
 
 # Multi Force Subscribe Channels (NEW)
 # Add multiple channel IDs separated by space
-FORCE_SUB_CHANNELS = [int(ch) for ch in environ.get("FORCE_SUB_CHANNELS", "-1002918526071").split()]
+FORCE_SUB_CHANNELS = [int(ch) for ch in environ.get("FORCE_SUB_CHANNELS", "-1002752267976").split()]
 
 # File Caption Information
 CUSTOM_FILE_CAPTION = environ.get("CUSTOM_FILE_CAPTION", f"{script.CAPTION}")
